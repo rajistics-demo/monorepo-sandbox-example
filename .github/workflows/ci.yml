@@ -1,0 +1,107 @@
+# CI for the example monorepo. Runs on GitHub-hosted runners only.
+#
+#   secret-scan   gitleaks over the full Git history
+#   server-suite  the developer path: compose up, dev:bootstrap, generate the corpus days the tests
+#                 name, full Rails suite against PostgreSQL 14, 16 and 17
+#   events-svc    cargo test for the Rust service
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AUTH_MODE: none
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks (full history)
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git --redact --no-banner --exit-code 1 /repo
+
+  server-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner facts
+        run: |
+          nproc; free -g; df -h / /tmp; docker version --format '{{.Server.Version}}'; docker compose version
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libpq-dev
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        with:
+          working-directory: server
+          bundler-cache: true
+      - name: Start services
+        working-directory: server
+        run: docker compose -p ci up -d --wait --wait-timeout 300
+      - name: dev:bootstrap (custom db:setup replacement)
+        working-directory: server
+        run: bin/rails dev:bootstrap
+      - name: Settlement corpus (generate only the days the tests name)
+        run: |
+          mkdir -p server/tmp/evidence
+          python3 tools/settlements-corpus/materialize.py --only-from-tests server/test \
+            --min-node-free-bytes 3000000000 --report server/tmp/evidence/corpus-materialize.json
+      - name: Full server suite
+        working-directory: server
+        env:
+          EVIDENCE_JSON: tmp/evidence/ci-suite.json
+        run: bin/rails test
+      - name: Test counts
+        if: always()
+        working-directory: server
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os
+          p = "tmp/evidence/ci-suite.json"
+          if not os.path.exists(p):
+              print("no evidence file"); raise SystemExit(0)
+          d = json.load(open(p))
+          print(f"classification={d['classification']} counts={d['counts']} total={len(d['results'])} wall={d['wall_seconds']}s")
+          EOF
+      - name: Service logs on failure
+        if: failure()
+        working-directory: server
+        run: docker compose -p ci logs --no-color --tail 200
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: server-suite-evidence
+          path: server/tmp/evidence/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  events-svc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: rust:1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo test --locked
+        working-directory: services/events-svc
+        run: cargo test --locked

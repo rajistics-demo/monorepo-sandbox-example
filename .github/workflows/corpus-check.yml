@@ -1,0 +1,59 @@
+# Manual: streamed generation and SHA-256 check of the full settlement manifest (731 days, about 9.6 GB).
+# Each day is generated in memory, hashed, compared with server/data/settlements/manifest.json, and
+# discarded. One calendar quarter per job. Nothing is written to disk or published, so this checks the
+# generator, not a materialized checkout or the test suite.
+name: corpus-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quarter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Streamed generate + hash check, quarter ${{ matrix.shard }}
+        run: |
+          python3 --version
+          python3 tools/settlements-corpus/materialize.py --check-only --shard ${{ matrix.shard }} \
+            --jobs "$(nproc)" --report "out/check-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: corpus-check-${{ matrix.shard }}
+          path: out/
+          retention-days: 14
+
+  summary:
+    needs: quarter
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: corpus-check-*
+          path: out
+          merge-multiple: true
+      - name: Totals
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json
+          rs = [json.load(open(p)) for p in sorted(glob.glob("out/check-*.json"))]
+          files = sum(r["check_only"]["checked"] for r in rs)
+          size = sum(r["check_only"]["bytes_generated"] for r in rs)
+          bad = sum(r["check_only"]["bad_count"] for r in rs)
+          print(f"quarters={len(rs)} files={files} bytes={size} mismatches={bad} "
+                f"generator_matches_manifest={all(r['generator_matches_manifest'] for r in rs)}")
+          assert len(rs) == 8 and files == 731 and size == 9596945070 and bad == 0
+          assert all(r["generator_matches_manifest"] for r in rs)
+          EOF

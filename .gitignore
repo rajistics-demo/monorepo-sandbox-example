@@ -1,0 +1,10 @@
+/build/
+/server/tmp/
+/server/log/
+/server/vendor/
+/server/.bundle/
+/services/events-svc/target/
+.env
+*.pem
+/server/data/settlements/**/*.csv
+/server/data/settlements/**/.*.part
